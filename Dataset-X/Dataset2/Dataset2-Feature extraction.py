@@ -26,7 +26,6 @@ from keras.models import Sequential
 from keras.layers import Dense,Dropout,Activation,Flatten
 from keras.optimizers import SGD
 from keras.utils.np_utils import to_categorical
-#from mlxtend.plotting import plot_decision_regions #用于画决策边界
 
 import xgboost as xgb
 from xgboost import XGBClassifier, XGBRegressor
@@ -56,295 +55,280 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 import pickle
-batch1 = pickle.load(open(r'.\Data\batch1.pkl', 'rb'))
-#remove batteries that do not reach 80% capacity
-del batch1['b1c8']
-del batch1['b1c10']
-del batch1['b1c12']
-del batch1['b1c13']
-del batch1['b1c22']
-numBat1 = len(batch1.keys())
-batch2 = pickle.load(open(r'.\Data\batch2.pkl','rb'))
-batch2_keys = ['b2c7', 'b2c8', 'b2c9', 'b2c15', 'b2c16']
-batch1_keys = ['b1c0', 'b1c1', 'b1c2', 'b1c3', 'b1c4']
-add_len = [662, 981, 1060, 208, 482];
-for i, bk in enumerate(batch1_keys):
-    batch1[bk]['cycle_life'] = batch1[bk]['cycle_life'] + add_len[i]
-    for j in batch1[bk]['summary'].keys():
-        if j == 'cycle':
-            batch1[bk]['summary'][j] = np.hstack((batch1[bk]['summary'][j], batch2[batch2_keys[i]]['summary'][j] + len(batch1[bk]['summary'][j])))
-        else:
-            batch1[bk]['summary'][j] = np.hstack((batch1[bk]['summary'][j], batch2[batch2_keys[i]]['summary'][j]))
-    last_cycle = len(batch1[bk]['cycles'].keys())
-    for j, jk in enumerate(batch2[batch2_keys[i]]['cycles'].keys()):
-        batch1[bk]['cycles'][str(last_cycle + j)] = batch2[batch2_keys[i]]['cycles'][jk]
-del batch2['b2c7']
-del batch2['b2c8']
-del batch2['b2c9']
-del batch2['b2c15']
-del batch2['b2c16']
-numBat2 = len(batch2.keys())
-batch3 = pickle.load(open(r'.\Data\batch3.pkl','rb'))
-# remove noisy channels from batch3
-del batch3['b3c37']
-del batch3['b3c2']
-del batch3['b3c23']
-del batch3['b3c32']
-del batch3['b3c42']
-del batch3['b3c43']
-numBat3 = len(batch3.keys())
-numBat = numBat1 + numBat2 + numBat3
-bat_dict = {**batch1, **batch2, **batch3}
 
 import numpy as np
-from scipy.interpolate import interp1d, splrep
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+import pystan
+
+def hbm_vary_intercepts_slopes_model(train_df, test_df, selected_names, individual_names, feat_dim):
+
+    group_num = len(train_df.cluster_c4.unique())
+    with_group_names = selected_names.copy()
+    with_group_names.append('cluster_c4')
+
+    x_train, x_test = train_df.loc[:, with_group_names], test_df.loc[:, with_group_names]
+    y_train, y_test = train_df.loc[:, 'Lifetime'], test_df.loc[:, 'Lifetime']
+
+
+    group_level_variables_train = np.zeros((group_num, 1))
+    for group_idx in range(group_num):
+        mean_gf = np.mean(x_train.loc[x_train.cluster_c4 == group_idx, 'avg_stress'].values)
+        group_level_variables_train[group_idx, 0] = mean_gf
+
+    raw_group_ind_train = x_train.loc[:, 'cluster_c4'].values.astype(int)
+    raw_group_ind_test = x_test.loc[:, 'cluster_c4'].values.astype(int)
+
+    transformer = StandardScaler()
+    processed_x_train = transformer.fit_transform(x_train.loc[:, individual_names])
+    processed_x_test = transformer.transform(x_test.loc[:, individual_names])
+
+    stan_code = """
+    data {
+        int<lower=0> N; 
+        int<lower=0> K;  
+        int<lower=0> J;  
+        int<lower=1, upper=J> group[N];  
+        matrix[N, K] X; 
+        vector[N] y;  
+        vector[J] group_avg_stress;  
+    }
+    parameters {
+        real g_intercept;
+        real<lower=0> sigma_intercept;
+        real<lower=0> sigma_slope0;
+        real<lower=0> sigma_slope1;
+        real<lower=0> sigma;
+        vector[J] intercept_raw;
+        vector[J] slope0_raw;
+        vector[J] slope1_raw;
+        real slope0_mu;
+        real slope1_mu;
+    }
+    transformed parameters {
+        vector[J] intercept;
+        vector[J] slope0;
+        vector[J] slope1;
+        intercept = g_intercept + sigma_intercept * intercept_raw;
+        slope0 = slope0_mu + sigma_slope0 * slope0_raw;
+        slope1 = slope1_mu + sigma_slope1 * slope1_raw;
+    }
+    model {
+        intercept_raw ~ normal(0, 1);
+        slope0_raw ~ normal(0, 1);
+        slope1_raw ~ normal(0, 1);
+        y ~ normal(intercept[group] + slope0[group] .* X[, 1] + slope1[group] .* X[, 2], sigma);
+    }
+    generated quantities {
+        vector[N] y_pred;
+        for (n in 1:N)
+            y_pred[n] = normal_rng(intercept[group[n]] + slope0[group[n]] * X[n, 1] + slope1[group[n]] * X[n, 2], sigma);
+    }
+    """
+
+    stan_model = pystan.StanModel(model_code=stan_code)
+
+    # 准备数据
+    stan_data = {
+        'N': processed_x_train.shape[0],
+        'K': processed_x_train.shape[1],
+        'J': group_num,
+        'group': raw_group_ind_train + 1,  
+        'X': processed_x_train,
+        'y': y_train.values,
+        'group_avg_stress': group_level_variables_train.flatten()
+    }
+
+    fit = stan_model.sampling(data=stan_data, iter=2000, chains=4, warmup=1000, thin=1)
+
+    y_pred = fit.extract()['y_pred'].mean(axis=0)
+
+    tol_mape_hierarchical = mean_absolute_percentage_error(y_true=y_test.values, y_pred=y_pred)
+    tol_rmse_hierarchical = mean_squared_error(y_true=y_test.values, y_pred=y_pred, squared=False)
+
+    return [tol_rmse_hierarchical, tol_mape_hierarchical, fit]
+
+DATA_DIR = '../hbm_related_codes/train_test_split_revised/'
+train_df = pd.read_csv(DATA_DIR + 'training.csv',index_col=0)
+testin_df = pd.read_csv(DATA_DIR + 'test_in.csv',index_col=0)
+testout_df = pd.read_csv(DATA_DIR + 'test_out.csv',index_col=0)
+
+# Calculate the corresponding features mentioned in the paper
+# avg_stress: Stress_avg - the group level feature
+# log_mean_dqdv_dchg_mid_3_0, log_delta_CV_time_03 are the top two individual-level features mention in Table 1
+
+                                  
+train_df['log_mean_dqdv_dchg_mid_3_0'] = np.log(abs(train_df.mean_dqdv_dchg_mid_3_0))
+testin_df['log_mean_dqdv_dchg_mid_3_0'] = np.log(abs(testin_df.mean_dqdv_dchg_mid_3_0))
+testout_df['log_mean_dqdv_dchg_mid_3_0'] = np.log(abs(testout_df.mean_dqdv_dchg_mid_3_0))
+
+train_df['log_delta_CV_time_03'] = np.log(abs(train_df.delta_CV_time_3_0))
+testin_df['log_delta_CV_time_03'] = np.log(abs(testin_df.delta_CV_time_3_0))
+testout_df['log_delta_CV_time_03'] = np.log(abs(testout_df.delta_CV_time_3_0))
+
+train_df['log(Lifetime)'] = np.log(train_df.Lifetime)
+testin_df['log(Lifetime)'] = np.log(testin_df.Lifetime)
+testout_df['log(Lifetime)'] = np.log(testout_df.Lifetime)
+
+selected_names = ['avg_stress', 'log_mean_dqdv_dchg_mid_3_0','log_delta_CV_time_03','DoD']
+individual_names = [ 'log_mean_dqdv_dchg_mid_3_0','log_delta_CV_time_03','DoD']
+group_num = len(train_df.cluster_c4.unique())
+with_group_names = selected_names.copy()
+with_group_names.append('cluster_c4')
+
+x_train = train_df.loc[:, with_group_names]
+x_test = testin_df.loc[:, with_group_names]
+x_testout = testout_df.loc[:, with_group_names]
+
+y_train = train_df.loc[:, 'Lifetime']
+y_test = testin_df.loc[:, 'Lifetime']
+y_testout = testout_df.loc[:, 'Lifetime']
+
+
+transformer = StandardScaler()
+processed_x_train = transformer.fit_transform(x_train.loc[:, individual_names])
+processed_x_test = transformer.transform(x_test.loc[:, individual_names])
+processed_x_testout = transformer.transform(x_testout.loc[:, individual_names])
+
+import json
+import numpy as np
+import pandas as pd
+from scipy.interpolate import pchip_interpolate
+from scipy.signal import argrelextrema
 import matplotlib.pyplot as plt
-plt.rcParams['figure.dpi'] = 300 
-Q100_10 = []
-xx = np.arange(2.001, 3.46, 0.01)
-for i in bat_dict.keys():
-    if i == 'b2c1':
-        Qd1 = bat_dict[i]['cycles']['12']['Qd']
-        V1 = bat_dict[i]['cycles']['12']['V']
 
-        Qd2 = bat_dict[i]['cycles']['101']['Qd']
-        V2 = bat_dict[i]['cycles']['101']['V']
+### Define a function to load RPT data and convert the data type ###
+def convert_RPT_to_dict(RPT_json_dir,cell,subfolder):
+    with open(RPT_json_dir+subfolder+cell+'.json','r') as file:
+        data_dict = json.loads(json.load(file))
+    
+    # Convert time series data from string to np.datetime64
+    for iii, start_time in enumerate(data_dict['start_stop_time']['start']):
+        if start_time != '[]':
+            data_dict['start_stop_time']['start'][iii] = np.datetime64(start_time)
+            data_dict['start_stop_time']['stop'][iii] = np.datetime64(data_dict['start_stop_time']['stop'][iii])
+        else:
+            data_dict['start_stop_time']['start'][iii] = []
+            data_dict['start_stop_time']['stop'][iii] = []
 
-        # Process dataset 1
-        m1 = []
-        n1 = []
+    for iii in range(len(data_dict['start_stop_time']['start'])):
+        data_dict['QV_charge_C_2']['t'][iii] = list(map(np.datetime64,data_dict['QV_charge_C_2']['t'][iii]))
+        data_dict['QV_discharge_C_2']['t'][iii] = list(map(np.datetime64,data_dict['QV_discharge_C_2']['t'][iii]))
+        data_dict['QV_charge_C_5']['t'][iii] = list(map(np.datetime64,data_dict['QV_charge_C_5']['t'][iii]))
+        data_dict['QV_discharge_C_5']['t'][iii] = list(map(np.datetime64,data_dict['QV_discharge_C_5']['t'][iii]))
+    
+    # Return the preprocessed Python Dictionary
+    return data_dict
 
-        for k in range(1, len(Qd1)):
-            if Qd1[k] >= 1e-8 and Qd1[k] > Qd1[k-1] and V1[k] < V1[k-1] and 2.0 <= V1[k] <= 3.59:
-                m1.append(Qd1[k])
-                n1.append(V1[k])
+### Define a function to differentiate interpolated QV curves
+def diff_QV(QV_int_dir,cell,subfolder,V_interpolate):
+    # Transpose the preprocessed interpolated QV curves to have each row 
+    # representing a week, and save as np array for easier indexing
+    QV_discharge_interpolate = pd.read_csv(QV_int_dir+subfolder+cell+'.csv',header=None).T
+    QV_array = QV_discharge_interpolate.to_numpy()
+    
+    # Create empty lists and find numerical derivatives of the QV curve
+    dQdV = []; 
+    for i in range(len(QV_array)):
+        Q = QV_array[i]
+        dQdV.append(np.diff(Q)/np.diff(V_interpolate))
+    
+    # Save and return as arrays for easier indexing afterward
+    dQdV_array = np.array(dQdV)
+    return dQdV_array
 
-        m1 = np.array(m1)
-        n1 = np.array(n1)
-        if not any(2 <= v <= 3.5 for v in n1):
-            continue 
+### Define a function to calculate the lifetime ###
+def lifetime(capacity_fade_dir,cell,subfolder):
+    # Read capacity fade from preprocessed CSV file
+    capacity_fade_data = pd.read_csv(capacity_fade_dir+subfolder+cell+'.csv')
+    # Raw measurements (Q and time)
+    xi = capacity_fade_data['Time'].values
+    yi = capacity_fade_data['Capacity'].values
+    # Interpolation range of time
+    x = np.arange(0,np.ceil(np.max(xi)),0.001)
+    # Interpolated capacity fade
+    y = pchip_interpolate(xi, yi, x)
+    
+    # Find the lifetime (i.e., time stamp at which y <=0.2)
+    life_idx = np.argmin(np.abs(y-0.26))
+    life = x[life_idx]
+    return np.round(life,3)
+    
 
-        try:
-            interp_func1 = interp1d(n1, m1, kind='slinear')
-            yy1 = interp_func1(xx)
-        except ValueError:
-            print('Value Range Error', i)
-            continue
+if __name__ == '__main__':
+    # List of cells used in this paper. Some cells from the dataset didn't 
+    # reach the EOL at the time when we finalized results for this paper 
+    valid_cells = pd.read_csv('valid_cells_paper.csv').values.flatten().tolist()
+    
+    # Cell in Release 2.0 (to determine the proper subfolder in released dataset)
+    batch2 = ['G57C1','G57C2','G57C3','G57C4','G58C1', 'G26C3','G49C1','G49C2','G49C3','G49C4','G50C1','G50C3','G50C4'] 
 
-
-        yy1 = interp_func1(xx)
-
-        # Process dataset 2
-        m2 = []
-        n2 = []
-
-        for k in range(1, len(Qd2)):
-            if Qd2[k] >= 1e-8 and Qd2[k] > Qd2[k-1] and V2[k] < V2[k-1] and 2.0 <= V2[k] <= 3.59:
-                m2.append(Qd2[k])
-                n2.append(V2[k])
-
-        m2 = np.array(m2)
-        n2 = np.array(n2)
-        if not any(2.2 <= v <= 3.3 for v in n2):
-            continue 
-
-        try:
-            interp_func2 = interp1d(n2, m2, kind='slinear')
-            yy2 = interp_func1(xx)
-        except ValueError:
-            print('Value Range Error', i)
-            continue
-
-        yy2 = interp_func2(xx)
-        if np.min(yy2 - yy1) < -0.13 or np.max(yy2 - yy1) > 0.01:
-            print('Outlier Error', i)
-            continue
-        if any(np.diff(yy2-yy1) > 0.03):
-            print('Jitter Error', i)
-            continue  
-        plt.plot(yy2-yy1,xx,linewidth=0.5)
-        plt.xlim([-0.16, 0.02])
-        plt.ylim([2.2, 3.3])
-        Q100_10.append(yy2-yy1)
-    elif i ==  'b2c17':
-        Qd1 = bat_dict[i]['cycles']['10']['Qd']
-        V1 = bat_dict[i]['cycles']['10']['V']
-
-        Qd2 = bat_dict[i]['cycles']['101']['Qd']
-        V2 = bat_dict[i]['cycles']['101']['V']
-
-        # Process dataset 1
-        m1 = []
-        n1 = []
-
-        for k in range(1, len(Qd1)):
-            if Qd1[k] >= 1e-8 and Qd1[k] > Qd1[k-1] and V1[k] < V1[k-1] and 2.0 <= V1[k] <= 3.59:
-                m1.append(Qd1[k])
-                n1.append(V1[k])
-
-        m1 = np.array(m1)
-        n1 = np.array(n1)
-        if not any(2 <= v <= 3.6 for v in n1):
-            continue 
-
-        try:
-            interp_func1 = interp1d(n1, m1, kind='slinear')
-            yy1 = interp_func1(xx)
-        except ValueError:
-            print('Value Range Error', i)
-            continue
-
-
-        yy1 = interp_func1(xx)
-
-        # Process dataset 2
-        m2 = []
-        n2 = []
-
-        for k in range(1, len(Qd2)):
-            if Qd2[k] >= 1e-8 and Qd2[k] > Qd2[k-1] and V2[k] < V2[k-1] and 2.0 <= V2[k] <= 3.59:
-                m2.append(Qd2[k])
-                n2.append(V2[k])
-
-        m2 = np.array(m2)
-        n2 = np.array(n2)
-        if not any(2.2 <= v <= 3.6 for v in n2):
-            continue 
-
-        try:
-            interp_func2 = interp1d(n2, m2, kind='slinear')
-            yy2 = interp_func1(xx)
-        except ValueError:
-            print('Value Range Error', i)
-            continue
-
-        yy2 = interp_func2(xx)
-        if np.min(yy2 - yy1) < -0.13 or np.max(yy2 - yy1) > 0.01:
-            print('Outlier Error', i)
-            continue
-        if any(np.diff(yy2-yy1) > 0.03):
-            print('Jitter Error', i)
-            continue  
-        plt.plot(yy2-yy1,xx,linewidth=0.5)
-        plt.xlim([-0.16, 0.02])
-        plt.ylim([2.2, 3.3])
-        Q100_10.append(yy2-yy1)
-    else:
-        Qd1 = bat_dict[i]['cycles']['10']['Qd']
-        V1 = bat_dict[i]['cycles']['10']['V']
-
-        Qd2 = bat_dict[i]['cycles']['100']['Qd']
-        V2 = bat_dict[i]['cycles']['100']['V']
-
-        # Process dataset 1
-        m1 = []
-        n1 = []
-
-        for k in range(1, len(Qd1)):
-            if Qd1[k] >= 1e-8 and Qd1[k] > Qd1[k-1] and V1[k] < V1[k-1] and 2.0 <= V1[k] <= 3.59:
-                m1.append(Qd1[k])
-                n1.append(V1[k])
-
-        m1 = np.array(m1)
-        n1 = np.array(n1)
-        if not any(2 <= v <= 3.6 for v in n1):
-            continue 
-
-        try:
-            interp_func1 = interp1d(n1, m1, kind='slinear')
-            yy1 = interp_func1(xx)
-        except ValueError:
-            print('Value Range Error', i)
-            continue
-
-
-        yy1 = interp_func1(xx)
-
-        # Process dataset 2
-        m2 = []
-        n2 = []
-
-        for k in range(1, len(Qd2)):
-            if Qd2[k] >= 1e-8 and Qd2[k] > Qd2[k-1] and V2[k] < V2[k-1] and 2.0 <= V2[k] <= 3.59:
-                m2.append(Qd2[k])
-                n2.append(V2[k])
-
-        m2 = np.array(m2)
-        n2 = np.array(n2)
-        if not any(2.2 <= v <= 3.6 for v in n2):
-            continue 
-
-        try:
-            interp_func2 = interp1d(n2, m2, kind='slinear')
-            yy2 = interp_func1(xx)
-        except ValueError:
-            print('Value Range Error', i)
-            continue
-
-        yy2 = interp_func2(xx)
+    ### Main directory for the dataset ### TO MODIFY
+    main_dir = r'G:\Predicting battery lifetime'
+    # Directory of raw JSON files for RPT
+    RPT_json_dir = main_dir+'/RPT_json/'
+    # Directory of preprocessed (interpolated) QV curves
+    QV_int_dir = main_dir+'/Q_interpolated/'
+    # Directory of preprocessed capacity vs. time data
+    capacity_fade_dir = main_dir+'/capacity_fade/' 
+    
+    
+    # Create dictionaries for dQdV curves
+    dQdV_dict = {}
+    life = {}
+  
+    # 1000 equally spaced voltage points for deriving derivatives. This is for 
+    # consistency with the interpolation during the preprocessing. When we extract
+    # features, we use the full voltage range (3.0V to 4.2V).
+    V_interpolate = np.linspace(3,4.18,1000)  
+    
+    # DataFrame to store the results
+    results = pd.DataFrame(columns=np.arange(1000))
+    
+    for i,cell in enumerate(valid_cells):
+        if cell in batch2:
+            subfolder = 'Release 2.0/'
+        else:
+            subfolder = 'Release 1.0/'
+        # Calculate the lifetime
+        life[cell] = lifetime(capacity_fade_dir,cell,subfolder)
+        # Derive differential curves
+        dQdV_dict[cell] = diff_QV(QV_int_dir,cell,subfolder,V_interpolate)
+        # Calculate the difference
+        diff = dQdV_dict[cell][4] - dQdV_dict[cell][0]
         
-        if any(np.diff(yy2-yy1) > 0.03):
-            print('Jitter Error', i)
-            continue  
-        plt.plot(yy2-yy1,xx,linewidth=0.5)
-        plt.xlim([-0.16, 0.02])
-        plt.ylim([2.15, 3.3])
-        Q100_10.append(yy2-yy1)
-plt.xlabel('Q100-Q10')
-plt.ylabel('V')
+        # Append the difference and lifetime to the DataFrame
+        results.loc[cell] =  np.append(diff, life[cell])
+    # save DataFrame to csv file
+    #results.to_csv('dQdV_diff_and_life.csv')
 
-Q100_10 = np.array(Q100_10)
-cycle_life = []
-for i in bat_dict.keys():
-    if i == 'b2c1':
-        continue
-    else:
-        cycle_life.append(bat_dict[i]['cycle_life'][0][0])
-cycle_life = np.array(cycle_life)
-var = np.var(Q100_10, axis=1)
+result_train_df = results.drop(results.columns[[-1]], axis=1).iloc[:, ::10][results.index.isin(train_df['Cell'])]
+result_testin_df = results.drop(results.columns[[-1]], axis=1).iloc[:, ::10][results.index.isin(testin_df['Cell'])]
+result_testout_df = results.drop(results.columns[[-1]], axis=1).iloc[:, ::10][results.index.isin(testout_df['Cell'])]
+y_train = results[results.columns[[-1]]][results.index.isin(train_df['Cell'])]
+y_test = results[results.columns[[-1]]][results.index.isin(testin_df['Cell'])]
+y_testout = results[results.columns[[-1]]][results.index.isin(testout_df['Cell'])]
 
-x_data = pd.DataFrame(Q100_10, columns=[f'col_{i}' for i in range(x.shape[1])])
-y_data = pd.DataFrame(cycle_life, columns=['cycle_life'])
+x_data = result_train_df
+y_data = y_train
 
 correlation_matrix = np.zeros((x_data.shape[1], x_data.shape[1]))
 
 
 for i in range(x_data.shape[1]):
-    baseline_column = x_data.iloc[:, i] 
+    baseline_column = x_data.iloc[:, i]  
     
     for j in range(x_data.shape[1]):
         modified_column = x_data.iloc[:, j] - baseline_column
-        corr, _ = pearsonr(modified_column, y_data['cycle_life'])
+        corr, _ = pearsonr(modified_column, y_data)
         correlation_matrix[j, i] = corr
 
 result_df = pd.DataFrame(correlation_matrix, columns=[f'Column {i+1}' for i in range(x_data.shape[1])], index=[f'Column {i+1}' for i in range(x_data.shape[1])])
 
-result_df_abs = result_df.abs()
-plt.rcParams['figure.dpi'] = 300 
-# Display every 10th tick label
-step = 10
-result_df_abs.columns = ['F$_{}$$_{}$'.format(i//10, i%10) for i in range(1, 101)]
-result_df_abs.index = ['F$_{}$$_{}$'.format(i//10, i%10) for i in range(1, 101)]
-
-plt.figure(figsize=(12, 10))
-heatmap = sns.heatmap(result_df_abs, cmap='coolwarm', fmt='.2f')
-
-# Get x and y tick locations
-xticks = heatmap.get_xticks()
-yticks = heatmap.get_yticks()
-
-# Select tick labels based on the step
-xtick_labels = result_df_abs.columns[::step]
-ytick_labels = result_df_abs.index[::step]
-
-# Set x and y tick locations and labels
-heatmap.set_xticks(xticks[::5])
-heatmap.set_xticklabels(xtick_labels, fontsize=15)
-
-heatmap.set_yticks(yticks[::5])
-heatmap.set_yticklabels(ytick_labels, fontsize=15)
 
 result_df_abs = result_df_abs.fillna(0)
 max_value_index  = result_df_abs.values.argmax()
 print(divmod(max_value_index, result_df_abs.shape[1]))
 print(result_df_abs.values.max())
+

@@ -5,19 +5,19 @@ import pandas as pd
 import numpy as np
 import seaborn as sns
 from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.patches import Rectangle
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.pylab import rcParams
-from matplotlib.patches import FancyArrowPatch
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import pearsonr, spearmanr, skew, kurtosis
 
 from sklearn.linear_model import LogisticRegression
-
-from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import ElasticNetCV
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.preprocessing import LabelEncoder
 
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, RepeatedKFold, cross_val_score, GridSearchCV, cross_val_predict
 
-from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, roc_curve, accuracy_score
+from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score, roc_curve, accuracy_score,mean_squared_error, mean_absolute_percentage_error, mean_absolute_error
 from sklearn import cluster
 from collections import Counter
 
@@ -28,7 +28,7 @@ from keras.optimizers import SGD
 from keras.utils.np_utils import to_categorical
 
 import xgboost as xgb
-from xgboost import XGBClassifier
+from xgboost import XGBClassifier, XGBRegressor
 
 from sklearn.ensemble import AdaBoostClassifier, BaggingClassifier, ExtraTreesClassifier
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
@@ -43,133 +43,196 @@ from imblearn.combine import SMOTETomek, SMOTEENN
 from imblearn.ensemble import BalancedRandomForestClassifier, BalancedBaggingClassifier, EasyEnsembleClassifier, RUSBoostClassifier
 
 import time
+from functools import reduce
 
-import sys
-sys.path.append('../')
-import time
-import pickle
+import copy
+from functools import reduce
+import glob
+import json
+import os
+from pathlib import Path
 
-import numpy as np
+def sortKeyFunc(s):
+    return int(os.path.basename(s)[4:-4])
+
+def load_dataset(folder):
+    files = glob.glob(f'./Data/data/{folder}/*.csv')
+    files.sort(key=sortKeyFunc) # glob returns list with arbitrary order
+    
+    l = len(files)
+    dataset = np.zeros((l, 1000, 99))
+    
+    for k, file in enumerate(files):
+        cell = np.genfromtxt(file, delimiter=',')
+        dataset[k,:,:] = cell # flip voltage dimension
+    
+    return dataset
+
+def get_RMSE_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred):
+    """
+    Calculate RMSE for three datasets. Use units of cycles instead of log(cycles)
+    """
+    
+    RMSE_train = mean_squared_error(np.power(10, y_train), np.power(10, y_train_pred), squared=False)
+    RMSE_test1 = mean_squared_error(np.power(10, y_test1_mod), np.power(10, y_test1_pred), squared=False)
+    RMSE_test2 = mean_squared_error(np.power(10, y_test2), np.power(10, y_test2_pred), squared=False)
+
+    return RMSE_train, RMSE_test1, RMSE_test2
+
+def get_MAPE_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred):
+    """
+    Calculate MAPE for three datasets. Use units of cycles instead of log(cycles)
+    """
+    
+    MAPE_train = mean_absolute_percentage_error(np.power(10, y_train), np.power(10, y_train_pred))
+    MAPE_test1 = mean_absolute_percentage_error(np.power(10, y_test1_mod), np.power(10, y_test1_pred))
+    MAPE_test2 = mean_absolute_percentage_error(np.power(10, y_test2), np.power(10, y_test2_pred))
+
+    return MAPE_train, MAPE_test1, MAPE_test2
+
 from sklearn.metrics import r2_score
 
-from utils.exp_util import extract_data, extract_input
-from utils.models import XGBModel
+def get_R2_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred):
+    """
+    Calculate R^2 for three datasets. Use units of cycles instead of log(cycles)
+    """
+    
+    R2_train = r2_score(np.power(10, y_train), np.power(10, y_train_pred))
+    R2_test1 = r2_score(np.power(10, y_test1_mod), np.power(10, y_test1_pred))
+    R2_test2 = r2_score(np.power(10, y_test2), np.power(10, y_test2_pred))
 
-import pdb
+    return R2_train, R2_test1, R2_test2
 
-file_path1 = r'D:\项目\燃料电池\Code\battery-forecasting-main\test\x_eis_fixed_im.csv'
-file_path2 = r'D:\项目\燃料电池\Code\battery-forecasting-main\test\x_eis_fixed_re.csv'
+from sklearn.metrics import mean_absolute_error
 
-df1 = pd.read_csv(file_path1, header=None)
-df2 = pd.read_csv(file_path2, header=None)
+def get_Test_Error_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred):
+    """
+    Calculate Test Error (MAE) for three datasets. Use units of cycles instead of log(cycles)
+    """
+    
+    Test_Error_train = mean_absolute_error(np.power(10, y_train), np.power(10, y_train_pred))
+    Test_Error_test1 = mean_absolute_error(np.power(10, y_test1_mod), np.power(10, y_test1_pred))
+    Test_Error_test2 = mean_absolute_error(np.power(10, y_test2), np.power(10, y_test2_pred))
 
-im_feature = df1.iloc[:,30] - df1.iloc[:,56]
-im_feature = np.array(im_feature).reshape(-1, 1)
+    return Test_Error_train, Test_Error_test1, Test_Error_test2
 
-re_feature = df2.iloc[:,43] - df2.iloc[:,84]
-re_feature = np.array(re_feature).reshape(-1, 1)
 
-feature = np.concatenate((im_feature, re_feature), axis=1)
 
-channels = [1, 2, 3, 4, 5, 6, 7, 8]
-params = {'max_depth':100,
-          'n_splits':12,
-          'n_estimators':500,
-          'n_ensembles':10}
-experiment = 'fixed-discharge'
-log_name = '../results/{}/log-n-cells.txt'.format(experiment)
-input_name = 'actions'
-n_cells_list = [2, 4, 8, 16, 20]
-p = np.random.permutation(16)
-# Extract variable discharge data set
-cell_var, cap_ds_var, data_var = extract_data(experiment, channels)
-cell_ids = np.unique(cell_var)[p]
-x = extract_input(input_name, data_var)
+data_train = load_dataset('train')
+data_test1 = load_dataset('test1')
+data_test2 = load_dataset('test2')
 
-# output = next cycle discharge capacity
-y = cap_ds_var
-n_splits = params['n_splits']
+cycle_lives_train = np.genfromtxt('./Data/data/cycle_lives/train_cycle_lives.csv', delimiter=',')
+cycle_lives_test1 = np.genfromtxt('./Data/data/cycle_lives/test1_cycle_lives.csv', delimiter=',')
+cycle_lives_test2 = np.genfromtxt('./Data/data/cycle_lives/test2_cycle_lives.csv', delimiter=',')
 
-x = np.concatenate((x, feature), axis=1)
+y_train = np.log10(cycle_lives_train)
+y_test1 = np.log10(cycle_lives_test1)
+y_test2 = np.log10(cycle_lives_test2)
+data_test1_mod = data_test1.copy()
+cycle_lives_test1_mod = cycle_lives_test1.copy()
+y_test1_mod = y_test1.copy()
 
-for n_cells in n_cells_list:
-    experiment_name = '{}_{}cells_xgb'.format(input_name, n_cells)
-    experiment_info = '\nInput: {} \tOutput: Q_n+1 \t{} cells \nMax depth: {}\t N estimators: {}\t N ensembles: {}\tSplits:{}\n'.format(input_name, n_cells, params['max_depth'], params['n_estimators'],
-                                                                                                                                        params['n_ensembles'], params['n_splits'])
-    t0 = time.time()
-    r2s_tr = []
-    r2s_te = []
-    pes_tr = []
-    pes_te = []
+y_train = np.log10(cycle_lives_train)
+y_test1 = np.log10(cycle_lives_test1)
+y_test2 = np.log10(cycle_lives_test2)
+data_test1_mod = data_test1.copy()
+cycle_lives_test1_mod = cycle_lives_test1.copy()
+y_test1_mod = y_test1.copy()
 
-    for split in range(n_splits):
-        cell_ids_s = cell_ids[0:n_cells+2]
-        experiment_info = '\nInput: {} \tOutput: c(discharge)_n+1 \nMax depth: {}\tSplits:{}\n'.format(input_name, params['max_depth'], n_cells)
-        print(cell_ids[0])
-        print(cell_ids[1])
-        cell_test1 = cell_ids[0]
-        cell_test2 = cell_ids[1]
-        cell_train = cell_ids[2:n_cells+2]
-        idx_test1 = np.where(np.isin(cell_var, cell_test1))
-        idx_test2 = np.where(np.isin(cell_var, cell_test2))
-        idx_train = np.where(np.isin(cell_var, cell_train))
-        x_train = x[idx_train]
-        print('Number of datapoints = {}'.format(x_train.shape[0]))
-        y_train = cap_ds_var[idx_train]
-        x_test1 = x[idx_test1]
-        y_test1 = cap_ds_var[idx_test1]
-        x_test2 = x[idx_test2]
-        y_test2 = cap_ds_var[idx_test2]
+data_test1_mod = np.delete(data_test1_mod, 21, axis=0)
+cycle_lives_test1_mod = np.delete(cycle_lives_test1_mod, 21)
+y_test1_mod = np.delete(y_test1_mod, 21)
 
-        regressor = XGBModel(None, None, cell_ids_s, experiment, experiment_name, n_ensembles=params['n_ensembles'],
-                             n_splits=params['n_splits'], max_depth=params['max_depth'],
-                             n_estimators=params['n_estimators'])
-        y_pred_tr, y_pred_tr_err, y_pred_te1, y_pred_te1_err, y_pred_te2, y_pred_te2_err, _, _, _, _ = regressor.train_and_predict(x_train, y_train, x_test1, cell_test1, X_test2=x_test2, cell_test2=cell_test2)
-        r2s_tr.append(r2_score(y_train, y_pred_tr))
-        r2s_te.append(r2_score(y_test1, y_pred_te1))
-        r2s_te.append(r2_score(y_test2, y_pred_te2))
-        pes_tr.append(np.abs(y_train - y_pred_tr) / y_train)
-        pes_te.append(np.abs(y_test1 - y_pred_te1) / y_test1)
-        pes_te.append(np.abs(y_test2 - y_pred_te2) / y_test2)
-        cell_ids = np.roll(cell_ids, 2)
+Vdlin = np.linspace(3.6, 2, 1000)
+l1_ratios = [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1]
+alphas = np.logspace(0.001, 100, 20)
+colors_list = ['Blues', 'Reds', 'Oranges']
+np.random.seed(0)
 
-    r2_tr = np.median(np.array(r2s_tr))
-    r2_te = np.median(np.array(r2s_te))
-    pe_tr = 100*np.median(np.hstack(pes_tr).reshape(-1))
-    pe_te = 100*np.median(np.hstack(pes_te).reshape(-1))
-    print('Train R2:{}\t Train error: {}\t Test R2: {}\t Test error: {}'.format(r2_tr, pe_tr, r2_te, pe_te))
+data1 = data_train[:, ::10, 98] - data_train[:, ::10, 8]
+data2 = data_test1_mod[:, ::10, 98] - data_test1_mod[:, ::10, 8]
+data3 = data_test2[:, ::10, 98] - data_test2[:, ::10, 8]
+x = np.vstack((data1, data2, data3))
+y = np.vstack((cycle_lives_train.reshape(-1,1), cycle_lives_test1_mod.reshape(-1,1), cycle_lives_test2.reshape(-1,1)))
 
-print('Done.')
+def factors(n):
+    return sorted(list(reduce(list.__add__,
+                              ([i, n//i] for i in range(1, int(n**0.5) + 1) if n % i == 0))))
+sampling_frequencies = factors(1000)[:-1] # exclude 1000
+mV_frequencies = (3.6 - 2.0) / (1000 / np.array(sampling_frequencies)) * 1000 # mV
+RMSE_train = np.zeros((len(sampling_frequencies, )))
+RMSE_test1 = np.zeros((len(sampling_frequencies, )))
+RMSE_test2 = np.zeros((len(sampling_frequencies, )))
+MAPE_train = np.zeros((len(sampling_frequencies, )))
+MAPE_test1 = np.zeros((len(sampling_frequencies, )))
+MAPE_test2 = np.zeros((len(sampling_frequencies, )))
+R2_train = np.zeros((len(sampling_frequencies, )))
+R2_test1 = np.zeros((len(sampling_frequencies, )))
+R2_test2 = np.zeros((len(sampling_frequencies, )))
+ERR_train = np.zeros((len(sampling_frequencies, )))
+ERR_test1 = np.zeros((len(sampling_frequencies, )))
+ERR_test2 = np.zeros((len(sampling_frequencies, )))
 
-from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+for k, freq in enumerate(sampling_frequencies):
+    
+    # Define the log10 of the variance of Q100 - Q10, with different sampling frequencies:
+    X_train = np.log10(np.var((data_train[:, ::freq, 98] - data_train[:, ::freq, 8]), axis=1))
+    X_test1 = np.log10(np.var((data_test1_mod[:, ::freq, 98] - data_test1_mod[:, ::freq, 8]), axis=1))
+    X_test2 = np.log10(np.var((data_test2[:, ::freq, 98] - data_test2[:, ::freq, 8]), axis=1))
 
-# Calculate RMSE for training set
-RMSE_train = np.sqrt(mean_squared_error(y_train, y_pred_tr))
-# Calculate RMSE for test set 1
-RMSE_test1 = np.sqrt(mean_squared_error(y_test1, y_pred_te1))
-# Calculate RMSE for test set 2
-RMSE_test2 = np.sqrt(mean_squared_error(y_test2, y_pred_te2))
+    # Scale via standarization:
+    scaler = StandardScaler().fit(X_train.reshape(-1, 1))
+    X_train_scaled = scaler.transform(X_train.reshape(-1, 1))
+    X_test1_scaled = scaler.transform(X_test1.reshape(-1, 1))
+    X_test2_scaled = scaler.transform(X_test2.reshape(-1, 1))
 
-# Calculate average test RMSE
-RMSE_test_avg = (RMSE_test1 + RMSE_test2) / 2
+    # Define and fit linear regression via enet
+    model = XGBRegressor(learning_rate=0.05, n_estimators=200, max_depth=5, subsample=1, reg_alpha=0, reg_lambda=1, objective='reg:squarederror')
+#y_train_pred = cross_val_predict(model, X_train_scaled.reshape(-1, 1), y_train, cv=10)
+    model.fit(X_train_scaled.reshape(-1, 1), y_train)
 
-# Calculate MAPE for training set
-MAPE_train = mean_absolute_percentage_error(y_train, y_pred_tr)
-# Calculate MAPE for test set 1
-MAPE_test1 = mean_absolute_percentage_error(y_test1, y_pred_te1)
-# Calculate MAPE for test set 2
-MAPE_test2 = mean_absolute_percentage_error(y_test2, y_pred_te2)
+    # Predict on test sets
+    y_train_pred = model.predict(X_train_scaled)
+    y_test1_pred = model.predict(X_test1_scaled)
+    y_test2_pred = model.predict(X_test2_scaled)
+        
+    # Evaluate error
+    RMSE_train[k], RMSE_test1[k], RMSE_test2[k] = get_RMSE_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred)
+    MAPE_train[k], MAPE_test1[k], MAPE_test2[k] = get_MAPE_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred)
+    R2_train[k], R2_test1[k], R2_test2[k] = get_R2_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred)
+    ERR_train[k], ERR_test1[k], ERR_test2[k] = get_Test_Error_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred)
+    
+    if k == 0:
+        #save these results for histogram plot
+        severson_variance_model_train_pred = y_train_pred
+        severson_variance_model_test1_pred = y_test1_pred
+        severson_variance_model_test2_pred = y_test2_pred
 
-# Calculate average test MAPE
-MAPE_test_avg = (MAPE_test1 + MAPE_test2) / 2
+X_train = np.log10((data1[:, 60] - data1[:, 49]))
+X_test1 = np.log10((data2[:, 60] - data2[:, 49]))
+X_test2 = np.log10((data3[:, 60] - data3[:, 49]))
 
-# Print the results
-print("Training RMSE:", RMSE_train)
-print("Test set 1 RMSE:", RMSE_test1)
-print("Test set 2 RMSE:", RMSE_test2)
-print("Average Test RMSE:", RMSE_test_avg)
+scaler = StandardScaler().fit(X_train.reshape(-1, 1))
+X_train_scaled = scaler.transform(X_train.reshape(-1, 1))
+X_test1_scaled = scaler.transform(X_test1.reshape(-1, 1))
+X_test2_scaled = scaler.transform(X_test2.reshape(-1, 1))
 
-print("Training MAPE:", MAPE_train)
-print("Test set 1 MAPE:", MAPE_test1)
-print("Test set 2 MAPE:", MAPE_test2)
-print("Average Test MAPE:", MAPE_test_avg)
+model = XGBRegressor(learning_rate=0.1, n_estimators=260, max_depth=5,
+                     subsample=0.1, reg_alpha=0.001, reg_lambda=0.1,
+                     objective='reg:squarederror')
+
+model.fit(X_train_scaled, y_train)
+
+y_train_pred = model.predict(X_train_scaled)
+y_test1_pred = model.predict(X_test1_scaled)
+y_test2_pred = model.predict(X_test2_scaled)
+rmse_train, rmse_test1, rmse_test2 = get_RMSE_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred)
+mape_train, mape_test1, mape_test2 = get_MAPE_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred)
+r2_train, r2_test1, r2_test2 = get_R2_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred)
+err_train, err_test1, err_test2 = get_Test_Error_for_all_datasets(y_train_pred, y_test1_pred, y_test2_pred)
+
+print(np.mean(RMSE_train), np.mean(RMSE_test1), np.mean(RMSE_test2))
+print(np.mean(MAPE_train), np.mean(MAPE_test1), np.mean(MAPE_test2))
+print(np.mean(R2_train), np.mean(R2_test1), np.mean(R2_test2))
+print(np.mean(ERR_train), np.mean(ERR_test1), np.mean(ERR_test2))
